@@ -1,0 +1,267 @@
+import pandas as pd
+import streamlit as st
+from io import BytesIO
+
+from ponto_parser import processar_espelho_ponto_bytes
+
+# ----------------------------
+# CONFIGURAÇÃO DA PÁGINA
+# ----------------------------
+st.set_page_config(
+    page_title="Resumo de Ponto - Alva Serv",
+    page_icon="🕒",
+    layout="wide",
+)
+
+# ----------------------------
+# CONTROLES DE ESTADO
+# ----------------------------
+if "uploader_key" not in st.session_state:
+    st.session_state["uploader_key"] = 0
+
+
+# ----------------------------
+# ESTILOS (CSS)
+# ----------------------------
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background-color: #f5f7fb;
+    }
+
+    .alva-title {
+        font-size: 32px;
+        font-weight: 700;
+        margin-bottom: 0;
+        color: #1f2933;
+    }
+
+    .alva-subtitle {
+        font-size: 14px;
+        color: #6b7280;
+        margin-top: 4px;
+    }
+
+    .alva-card {
+        background: #ffffff;
+        padding: 20px 24px;
+        border-radius: 14px;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+        margin-bottom: 20px;
+    }
+
+    .stDownloadButton button {
+        border-radius: 999px;
+        padding: 0.6rem 1.8rem;
+        font-weight: 600;
+    }
+
+    .metric-label {
+        font-size: 13px;
+        color: #6b7280;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ----------------------------
+# SIDEBAR (NAVEGAÇÃO)
+# ----------------------------
+with st.sidebar:
+    st.image("logo_alvaserv.png", use_container_width=True)
+    st.markdown("### Navegação")
+    pagina = st.radio(
+        "",
+        ["Resumo de Ponto", "Ajuda / Como usar"],
+        index=0,
+    )
+    st.markdown("---")
+    st.markdown("**Alva Serv – Verificador de Ponto**")
+    st.caption("Versão 1.0")
+
+
+# ----------------------------
+# HEADER COM LOGO + TÍTULO
+# ----------------------------
+with st.container():
+    col_logo, col_title = st.columns([1, 3], gap="medium")
+
+    with col_logo:
+        st.image("logo_alvaserv.png", use_container_width=True)
+
+    with col_title:
+        st.markdown(
+            "<div class='alva-title'>Resumo de Ponto - Alva Serv</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div class='alva-subtitle'>Carregue os espelhos de ponto em PDF (um por escola). "
+            "O sistema consolida e gera uma planilha detalhada para conferência e arquivamento.</div>",
+            unsafe_allow_html=True,
+        )
+
+st.markdown("")  # espaçamento
+
+
+# ============================================================
+# PÁGINA 1 – RESUMO DE PONTO
+# ============================================================
+if pagina == "Resumo de Ponto":
+    # ----------------------------
+    # BLOCO DE UPLOAD
+    # ----------------------------
+    with st.container():
+        st.markdown("<div class='alva-card'>", unsafe_allow_html=True)
+
+        st.markdown("### 📂 Upload de espelhos de ponto")
+        st.markdown(
+            "- Você pode selecionar **um ou vários PDFs** de uma vez.\n"
+            "- Os PDFs precisam estar no modelo de espelho de ponto padrão.\n"
+            "- Ao final, será gerado um **Excel consolidado**."
+        )
+
+        arquivos_pdf = st.file_uploader(
+            "Selecione os arquivos de ponto em PDF",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key=f"upload_pdf_{st.session_state['uploader_key']}",
+        )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---------------------------------
+    # PROCESSAMENTO
+    # ---------------------------------
+    if arquivos_pdf:
+        st.markdown("")  # espaçamento
+
+        with st.container():
+            st.markdown("<div class='alva-card'>", unsafe_allow_html=True)
+            st.markdown("### ⚙️ Processamento")
+
+            st.info(f"{len(arquivos_pdf)} arquivo(s) carregado(s).")
+
+            dfs = []
+            for arquivo_pdf in arquivos_pdf:
+                with st.spinner(f"Processando: {arquivo_pdf.name}"):
+                    pdf_bytes = arquivo_pdf.read()
+                    df_resumo = processar_espelho_ponto_bytes(pdf_bytes)
+
+                if df_resumo.empty:
+                    st.warning(
+                        f"Não foi possível extrair dados de **{arquivo_pdf.name}**. "
+                        "Confirme se o layout está no padrão."
+                    )
+                    continue
+
+                df_resumo["Arquivo"] = arquivo_pdf.name
+                dfs.append(df_resumo)
+
+            if not dfs:
+                st.error("Nenhum PDF pôde ser processado. Verifique os arquivos enviados.")
+            else:
+                df_master = pd.concat(dfs, ignore_index=True)
+
+                # Remover coluna 'Pagina' se existir
+                if "Pagina" in df_master.columns:
+                    df_master = df_master.drop(columns=["Pagina"])
+
+                # Criar coluna 'Mes_Referencia'
+                df_master["Mes_Referencia"] = pd.to_datetime(
+                    df_master["Periodo_Fim"], format="%d/%m/%Y"
+                ).dt.to_period("M").astype(str)
+
+                st.success("Processamento concluído com sucesso!")
+
+                # ----------------------------
+                # METRICS DE RESUMO
+                # ----------------------------
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                total_func = df_master["Nome"].nunique()
+                total_escolas = df_master["Centro de Custo"].nunique()
+                total_meses = df_master["Mes_Referencia"].nunique()
+                total_linhas = len(df_master)
+
+                col_m1.metric("Funcionários", total_func)
+                col_m2.metric("Escolas", total_escolas)
+                col_m3.metric("Meses de referência", total_meses)
+                col_m4.metric("Registros na planilha", total_linhas)
+
+                st.markdown("")
+
+                # ----------------------------
+                # TABELA DETALHADA (view mais amigável)
+                # ----------------------------
+                st.markdown("### 📊 Planilha detalhada")
+                st.caption("Tabela consolidada por funcionário, escola e período.")
+
+                # Renomear apenas para exibição (Excel continua com nomes técnicos)
+                df_display = df_master.rename(
+                    columns={
+                        "Centro de Custo": "Centro de Custo",
+                        "Nome": "Nome",
+                        "Periodo_Inicio": "Período Início",
+                        "Periodo_Fim": "Período Fim",
+                        "Dias_trabalhados": "Dias Trabalhados",
+                        "Dias_abono": "Dias Abono",
+                        "Dias_ferias": "Dias Férias",
+                        "Dias_falta": "Dias Falta",
+                        "Abono_Atestado": "Abono – Atestado",
+                        "Abono_Feriado": "Abono – Feriado",
+                        "Abono_Folga": "Abono – Folga",
+                        "Arquivo": "Arquivo Origem",
+                        "Mes_Referencia": "Mês de Referência",
+                    }
+                )
+
+                st.dataframe(df_display, use_container_width=True)
+
+                # Criar Excel a partir do df_master original (não renomeado)
+                def gerar_excel_bytes(df):
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                        df.to_excel(writer, index=False, sheet_name="Detalhado")
+                    return output.getvalue()
+
+                excel_bytes = gerar_excel_bytes(df_master)
+
+                st.markdown("---")
+                st.markdown("### ⬇️ Exportar planilha")
+
+                col_b1, col_b2 = st.columns([2, 1])
+
+                with col_b1:
+                    st.download_button(
+                        label="Baixar Excel (planilha detalhada)",
+                        data=excel_bytes,
+                        file_name="resumo_ponto_alvaserv.xlsx",
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "spreadsheetml.sheet"
+                        ),
+                    )
+
+                # ----------------------------
+                # BOTÃO LIMPAR DADOS
+                # ----------------------------
+                with col_b2:
+                    if st.button("🧹 Limpar dados e começar novamente"):
+                        # força recriar o componente de upload, limpando arquivos
+                        st.session_state["uploader_key"] += 1
+                        st.experimental_rerun()
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    else:
+        # nada enviado ainda → card de instruções rápido
+        st.markdown("")
+        with st.container():
+            st.markdown("<div class='alva-card'>", unsafe_allow_html=True)
+cd ~/app_ponto
+source venv/bin/activate
+nano app.py
+
+
+

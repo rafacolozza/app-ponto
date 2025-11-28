@@ -5,33 +5,78 @@ from io import BytesIO
 import pdfplumber
 import pandas as pd
 
-# Regex para linhas de dia e horários
-# Exemplo:
-# 22/10/2025 - qua. 11:56 14:04 15:07 21:50 ...
-RE_LINHA_DIA = re.compile(r"^(\d{2}/\d{2}/\d{4})\s*-\s*([^\s]+)\s*(.*)$")
-RE_HORARIO = re.compile(r"\b\d{2}:\d{2}\b")
 
-# Palavras que indicam dia sem trabalho efetivo
-PALAVRAS_BLOQUEIO = [
-    "FÉRIAS",
-    "FERIAS",
-    "FALTA",
-    "ABONO APROVADO",
-    "FOLGA",
-    "FERIADO",
-]
+# ---------------------------------------------------------
+# Classificação de linha de dia
+# ---------------------------------------------------------
 
-# Motivos de abono para detalhar em colunas
-MOTIVOS_ABONO = ["Atestado", "Feriado", "Folga"]
-
-
-def extrair_nome(texto_pagina: str) -> str:
+def _classificar_linha_dia(linha: str):
     """
-    Procura 'Nome:' na linha.
-    - Se o nome estiver na mesma linha (ex: 'Nome: Fulano da Silva'), usa essa parte.
-    - Se a linha for só 'Nome:', pega a próxima linha.
+    Recebe a linha completa de um dia e devolve:
+    (tipo, info_extra)
+
+    tipo:
+        - "trabalhado"
+        - "abono"
+        - "ferias"
+        - "falta"
+        - "domingo"
+        - "afastamento"
+
+    info_extra pode marcar: atestado / feriado / folga
     """
-    linhas = texto_pagina.splitlines()
+
+    if not re.match(r"^\d{2}/\d{2}/\d{4}", linha):
+        return None, {}
+
+    texto = linha.upper()
+
+    tem_domingo = "DOMINGO" in texto
+    tem_ferias = "FÉRIAS" in texto or "FERIAS" in texto
+    tem_abono = "ABONO APROVADO" in texto
+    tem_feriado = "FERIADO" in texto
+    tem_atestado = "ATESTADO" in texto
+    tem_folga = "FOLGA" in texto
+    tem_palavra_falta = "FALTA" in texto
+    tem_afastamento = "AFASTAMENTO" in texto
+
+    # horários capturados
+    horarios = re.findall(r"\b(\d{2}):(\d{2})\b", linha)
+    num_horarios_reais = sum(1 for h, m in horarios if h != "00" or m != "00")
+    tem_horas_reais = num_horarios_reais >= 2
+
+    if tem_domingo:
+        return "domingo", {}
+
+    if tem_ferias:
+        return "ferias", {}
+
+    # NOVO: afastamento separado
+    if tem_afastamento:
+        return "afastamento", {}
+
+    if tem_abono or tem_feriado:
+        info = {
+            "atestado": tem_atestado,
+            "feriado": tem_feriado,
+            "folga": tem_folga,
+        }
+        return "abono", info
+
+    if tem_palavra_falta:
+        return "falta", {}
+
+    if tem_horas_reais:
+        return "trabalhado", {}
+
+    return "falta", {}
+
+
+# ---------------------------------------------------------
+# Extração de Nome / Centro de Custo
+# ---------------------------------------------------------
+
+def _extrair_nome(linhas):
     for i, l in enumerate(linhas):
         if "Nome:" in l:
             parte = l.split("Nome:", 1)[-1].strip()
@@ -42,163 +87,120 @@ def extrair_nome(texto_pagina: str) -> str:
     return "DESCONHECIDO"
 
 
-def extrair_centro_custo(texto_pagina: str) -> str:
-    """
-    Pega o trecho após 'Centro de Custo:'.
-    Ex:
-    Centro de Custo: 62.938.774/0001-15 - 01 - Colégio Miguel de Cervantes
-    """
-    linhas = texto_pagina.splitlines()
+def _extrair_centro_custo(linhas):
     for l in linhas:
         if "Centro de Custo:" in l:
             return l.split("Centro de Custo:", 1)[-1].strip()
-    return "NÃO ENCONTRADO"
+    return "DESCONHECIDO"
 
 
-def linha_tem_trabalho(linha: str) -> bool:
-    """
-    Retorna True se a linha representa um dia efetivamente trabalhado.
+# ---------------------------------------------------------
+# Processar 1 página (1 funcionário)
+# ---------------------------------------------------------
 
-    Regras:
-    - Só considera linhas que começam com data (dd/mm/aaaa).
-    - Ignora domingos.
-    - Ignora linhas com palavras de bloqueio (Férias, Falta, Abono Aprovado, Folga, Feriado…).
-    - Pega apenas os primeiros horários (batidas e colunas principais),
-      ignorando saldos finais (ex: 62:08, 67:29).
-    """
+def _processar_pagina(texto_pagina: str) -> dict:
+    linhas = texto_pagina.splitlines()
 
-    # Normaliza espaços
-    linha_norm = " ".join(linha.split())
+    nome = _extrair_nome(linhas)
+    centro = _extrair_centro_custo(linhas)
 
-    # Tem que ser linha de dia: precisa bater o regex de data no início
-    m = RE_LINHA_DIA.match(linha_norm)
-    if not m:
-        return False
-
-    texto_upper = linha_norm.upper()
-
-    # Domingo nunca conta como dia trabalhado
-    if "DOMINGO" in texto_upper:
-        return False
-
-    # Palavras que representam dia sem trabalho
-    if any(p in texto_upper for p in PALAVRAS_BLOQUEIO):
-        return False
-
-    # Pega os horários da linha (já normalizada)
-    horarios = RE_HORARIO.findall(linha_norm)
-    if not horarios:
-        return False
-
-    # Ignora possíveis saldos no fim (62:08, 67:29...), usando só as colunas principais
-    # 10 campos é um limite seguro: Ent1, Sai1, Ent2, Sai2, Normal, D.F., Crédito,
-    # Intervalo, Interjornada, H.E.1.
-    horarios_principais = horarios[:10] if len(horarios) > 10 else horarios
-
-    # Se algum desses horários principais for diferente de 00:00, consideramos trabalhado
-    return any(h != "00:00" for h in horarios_principais)
-
-
-def extrair_datas_periodo(texto_pagina: str):
-    """
-    Lê todas as datas da página e retorna (data mínima, data máxima)
-    """
+    dias_trab = dias_abono = dias_ferias = dias_falta = dias_afastamento = 0
+    ab_atestado = ab_feriado = ab_folga = 0
     datas = []
-    for linha in texto_pagina.splitlines():
-        linha_limpa = " ".join(linha.split())
-        m = RE_LINHA_DIA.match(linha_limpa)
-        if m:
-            data_str = m.group(1)
-            try:
-                d = datetime.strptime(data_str, "%d/%m/%Y").date()
-                datas.append(d)
-            except ValueError:
-                pass
 
-    if not datas:
-        return None, None
+    for linha in linhas:
+        if not re.match(r"^\d{2}/\d{2}/\d{4}", linha):
+            continue
 
-    return min(datas), max(datas)
+        data_str = linha[:10]
+        try:
+            datas.append(datetime.strptime(data_str, "%d/%m/%Y"))
+        except ValueError:
+            pass
 
+        tipo, info = _classificar_linha_dia(linha)
+        if not tipo:
+            continue
+
+        if tipo == "trabalhado":
+            dias_trab += 1
+
+        elif tipo == "abono":
+            dias_abono += 1
+            if info.get("atestado"):
+                ab_atestado += 1
+            if info.get("feriado"):
+                ab_feriado += 1
+            if info.get("folga"):
+                ab_folga += 1
+
+        elif tipo == "ferias":
+            dias_ferias += 1
+
+        elif tipo == "falta":
+            dias_falta += 1
+
+        elif tipo == "afastamento":
+            dias_afastamento += 1
+
+        # domingo é ignorado
+
+    if datas:
+        periodo_inicio = min(datas).strftime("%d/%m/%Y")
+        periodo_fim = max(datas).strftime("%d/%m/%Y")
+    else:
+        periodo_inicio = ""
+        periodo_fim = ""
+
+    return {
+        "Centro de Custo": centro,
+        "Nome": nome,
+        "Periodo_Inicio": periodo_inicio,
+        "Periodo_Fim": periodo_fim,
+        "Dias_trabalhados": dias_trab,
+        "Dias_abono": dias_abono,
+        "Dias_ferias": dias_ferias,
+        "Dias_falta": dias_falta,
+        "Dias_afastamento": dias_afastamento,   # NOVO
+        "Abono_Atestado": ab_atestado,
+        "Abono_Feriado": ab_feriado,
+        "Abono_Folga": ab_folga,
+    }
+
+
+# ---------------------------------------------------------
+# Função pública para o Streamlit
+# ---------------------------------------------------------
 
 def processar_espelho_ponto_bytes(pdf_bytes: bytes) -> pd.DataFrame:
-    """
-    Processa o PDF e retorna 1 linha por funcionário com:
+    buffer = BytesIO(pdf_bytes)
+    resultados = []
 
-    - Centro de Custo
-    - Nome
-    - Periodo_Inicio / Periodo_Fim
-    - Dias_trabalhados
-    - Dias_abono
-    - Dias_ferias
-    - Dias_falta
-    - Abono_Atestado / Abono_Feriado / Abono_Folga
-    """
-    registros = []
-
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-            texto = page.extract_text() or ""
-            if not texto.strip():
+    with pdfplumber.open(buffer) as pdf:
+        for pagina in pdf.pages:
+            texto = pagina.extract_text() or ""
+            if "Nome:" not in texto:
                 continue
+            info = _processar_pagina(texto)
+            resultados.append(info)
 
-            nome = extrair_nome(texto)
-            centro_custo = extrair_centro_custo(texto)
-            data_inicio, data_fim = extrair_datas_periodo(texto)
+    colunas = [
+        "Centro de Custo",
+        "Nome",
+        "Periodo_Inicio",
+        "Periodo_Fim",
+        "Dias_trabalhados",
+        "Dias_abono",
+        "Dias_ferias",
+        "Dias_falta",
+        "Dias_afastamento",  # NOVO
+        "Abono_Atestado",
+        "Abono_Feriado",
+        "Abono_Folga",
+    ]
 
-            dias_trabalhados = 0
-            dias_abono = 0
-            dias_ferias = 0
-            dias_falta = 0
-            motivo_counts = {m: 0 for m in MOTIVOS_ABONO}
+    if not resultados:
+        return pd.DataFrame(columns=colunas)
 
-            for linha in texto.splitlines():
-                linha_norm = " ".join(linha.split())
-                linha_upper = linha_norm.upper()
-
-                # Conta dia trabalhado
-                if linha_tem_trabalho(linha_norm):
-                    dias_trabalhados += 1
-
-                # Só analisamos linhas que realmente são de dia (começam com data)
-                m = RE_LINHA_DIA.match(linha_norm)
-                if not m:
-                    continue
-
-                # Classificações por tipo de dia
-                if "ABONO APROVADO" in linha_upper:
-                    dias_abono += 1
-                    for mot in MOTIVOS_ABONO:
-                        if mot.upper() in linha_upper:
-                            motivo_counts[mot] += 1
-
-                if "FÉRIAS" in linha_upper or "FERIAS" in linha_upper:
-                    dias_ferias += 1
-
-                if "FALTA" in linha_upper:
-                    dias_falta += 1
-
-            if nome != "DESCONHECIDO" and data_inicio and data_fim:
-                row = {
-                    "Centro de Custo": centro_custo,
-                    "Nome": nome,
-                    "Periodo_Inicio": data_inicio.strftime("%d/%m/%Y"),
-                    "Periodo_Fim": data_fim.strftime("%d/%m/%Y"),
-                    "Dias_trabalhados": dias_trabalhados,
-                    "Dias_abono": dias_abono,
-                    "Dias_ferias": dias_ferias,
-                    "Dias_falta": dias_falta,
-                }
-
-                # adiciona colunas por motivo de abono
-                for mot in MOTIVOS_ABONO:
-                    row[f"Abono_{mot}"] = motivo_counts[mot]
-
-                registros.append(row)
-
-    df = pd.DataFrame(registros)
-    if not df.empty:
-        df = df.sort_values(["Centro de Custo", "Nome"])
-
-    return df
+    return pd.DataFrame(resultados, columns=colunas)
 
